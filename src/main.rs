@@ -1,3 +1,3 @@
 fn main() {
-    pollster::block_on(wgpu_template::run());
+    pollster::block_on(monocle::run());
 }
