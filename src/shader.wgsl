@@ -1,5 +1,8 @@
 struct Uniform {
     projection: mat4x4<f32>,
+    mouse_position: vec2<f32>,
+    flashlight: u32,
+    flashglith_radius: f32,
 };
 
 struct VertexInput {
@@ -34,5 +37,17 @@ var s_diffuse: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.tex_coord);
+    var mix: f32 = 0.0;
+
+    if data.flashlight == 1 {
+        if length(in.position.xy - data.mouse_position) < data.flashglith_radius {
+            mix = 0.0;
+        } else {
+            mix = 0.9;
+        }
+    } else {
+        mix = 0.0;
+    }
+
+    return mix(textureSample(t_diffuse, s_diffuse, in.tex_coord), vec4(0.0, 0.0, 0.0, 1.0), mix);
 }

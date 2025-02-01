@@ -2,8 +2,9 @@ use cgmath::Zero;
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
-    event::{ElementState, Event, MouseButton, WindowEvent},
+    event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent},
     event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -37,6 +38,10 @@ const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniform {
     projection_matrix: [[f32; 4]; 4],
+    mouse_position: [f32; 2],
+    flashlight: u32, // used as bool
+    flashlight_radius: f32,
+    _padding: f32,
 }
 
 #[allow(unused)]
@@ -58,12 +63,15 @@ struct State<'a> {
     texture_bind_group: wgpu::BindGroup,
     texture: Texture,
 
+    ctrl_key_held: bool,
+
     // camera stuff
     camera_velocity: f32,
     camera_target: cgmath::Vector2<f32>, // origin
     camera_zoom: f32,
     click_start_position: Option<cgmath::Vector2<f32>>,
     last_mouse_position: cgmath::Vector2<f32>,
+    flashlight_radius_velocity: f32,
     //
 
     window: &'a Window,
@@ -170,6 +178,10 @@ impl<'a> State<'a> {
 
         let uniform = Uniform {
             projection_matrix: cgmath::ortho(0.0, width as _, 0.0, height as _, -1.0, 1.0).into(),
+            mouse_position: [0.0; 2],
+            flashlight: 0,
+            flashlight_radius: 130.0,
+            _padding: 0.0,
         };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -183,7 +195,7 @@ impl<'a> State<'a> {
                 label: Some("Uniform Bind group layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -284,16 +296,20 @@ impl<'a> State<'a> {
             camera_zoom: 1.0,
             click_start_position: None,
             last_mouse_position: cgmath::Vector2::zero(),
+            flashlight_radius_velocity: 0.0,
 
             texture_bind_group,
             texture,
 
-            window,
+            ctrl_key_held: false,
+
             surface,
             device,
             queue,
             config,
             size,
+
+            window,
         }
     }
 
@@ -317,24 +333,73 @@ impl<'a> State<'a> {
             WindowEvent::CursorMoved {
                 position: PhysicalPosition { x, y },
                 ..
-            } => self.last_mouse_position = cgmath::Vector2::new(*x as _, *y as _),
+            } => {
+                self.last_mouse_position = cgmath::Vector2::new(*x as _, *y as _);
+            }
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.click_start_position = Some(self.last_mouse_position),
+            } => {
+                self.click_start_position = Some(self.last_mouse_position);
+                self.window
+                    .set_cursor_icon(winit::window::CursorIcon::Grabbing);
+            }
 
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } => self.click_start_position = None,
+            } => {
+                self.click_start_position = None;
+                self.window
+                    .set_cursor_icon(winit::window::CursorIcon::Default);
+            }
 
             WindowEvent::MouseWheel {
                 delta: winit::event::MouseScrollDelta::LineDelta(_, y),
                 ..
-            } => self.camera_velocity += CAMERA_ACCELERATION * y,
+            } => {
+                if self.ctrl_key_held {
+                    self.flashlight_radius_velocity += CAMERA_ACCELERATION * y * 200.0;
+                } else {
+                    self.camera_velocity += CAMERA_ACCELERATION * y
+                }
+            }
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key:
+                            PhysicalKey::Code(KeyCode::ControlLeft | KeyCode::ControlRight),
+                        ..
+                    },
+                ..
+            } => self.ctrl_key_held = !self.ctrl_key_held,
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyF),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => self.uniform.flashlight = (self.uniform.flashlight == 0) as _,
+
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyR),
+                        ..
+                    },
+                ..
+            } => {
+                self.camera_velocity = 0.0;
+                self.camera_target = cgmath::Vector2::zero();
+                self.camera_zoom = 1.0;
+            }
 
             _ => return false,
         }
@@ -374,7 +439,11 @@ impl<'a> State<'a> {
                 .unwrap();
         }
 
-        self.camera_velocity *= 0.98;
+        self.flashlight_radius_velocity *= 0.9;
+        self.camera_velocity *= 0.95;
+
+        self.uniform.flashlight_radius += self.flashlight_radius_velocity;
+        self.uniform.flashlight_radius = self.uniform.flashlight_radius.clamp(30.0, 1000.0);
         self.camera_zoom += self.camera_velocity;
         self.camera_zoom = self.camera_zoom.clamp(0.01, 100.0);
 
@@ -394,6 +463,8 @@ impl<'a> State<'a> {
         let top = center_y + (center_y / z) + o.y / z;
 
         self.uniform.projection_matrix = cgmath::ortho(left, right, bottom, top, -1.0, 1.0).into();
+        self.uniform.mouse_position = self.last_mouse_position.into();
+
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -471,8 +542,16 @@ pub async fn run() {
                 } if window_id == state.window.id() => {
                     if !state.input(event) {
                         match event {
-                            WindowEvent::CloseRequested => control_flow.exit(),
                             WindowEvent::Resized(physical_size) => state.resize(*physical_size),
+                            WindowEvent::CloseRequested
+                            | WindowEvent::KeyboardInput {
+                                event:
+                                    KeyEvent {
+                                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                        ..
+                                    },
+                                ..
+                            } => control_flow.exit(),
 
                             WindowEvent::RedrawRequested => {
                                 state.window().request_redraw();
